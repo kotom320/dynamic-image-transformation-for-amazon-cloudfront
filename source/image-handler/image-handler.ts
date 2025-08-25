@@ -14,7 +14,6 @@ import sharp, { FormatEnum, OverlayOptions, ResizeOptions } from "sharp";
 import {
   BoundingBox,
   BoxSize,
-  ContentTypes,
   ErrorMapping,
   ImageEdits,
   ImageFitTypes,
@@ -39,15 +38,21 @@ export class ImageHandler {
    */
   // eslint-disable-next-line @typescript-eslint/ban-types
   private async instantiateSharpImage(originalImage: Buffer, edits: ImageEdits, options: Object): Promise<sharp.Sharp> {
-    let image: sharp.Sharp = null;
+
     try {
-      if (edits && edits.rotate !== undefined && edits.rotate === null) {
-        image = sharp(originalImage, options); // for strip metadata case like strip_exif()
-      } else {
-        await sharp(originalImage, options).metadata(); // validation
-        image = sharp(originalImage, options).withMetadata();
-      }
-      return image;
+      let image = sharp(originalImage, options);
+    
+      await image.metadata(); // validation
+       // If rotate:null → preserve EXIF without applying orientation
+    // (e.g., for strip_exif() scenarios)
+    if (edits && edits.rotate !== undefined && edits.rotate === null) {
+      return image; // Optionally add .withMetadata() depending on policy
+    }
+     // Default: bake EXIF orientation into pixels (auto-orient) and preserve metadata
+    // rotate() without parameters normalizes EXIF orientation to 1 and rotates pixels accordingly
+    image = image.rotate().withMetadata();
+    return image;
+
     } catch (error) {
       this.handleError(
         error,
@@ -83,53 +88,78 @@ export class ImageHandler {
   }
 
   /**
+   * Instantiate a Sharp image for animation
+   * @param originalImage The original image buffer.
+   * @param edits The edits to be applied to an image
+   * @param baseOptions The base options for the Sharp image
+   * @returns A Sharp image object and a boolean indicating whether the image is animated
+   */
+  private async instantiateForAnimation(
+    originalImage: Buffer,
+    edits: ImageEdits,
+    baseOptions: { failOnError: boolean; animated: boolean; limitInputPixels: number | boolean }
+  ): Promise<{ image: sharp.Sharp; animated: boolean }> {
+
+    let options = { ...baseOptions };
+    let image = await this.instantiateSharpImage(originalImage, edits, options);
+  
+
+    if (options.animated) {
+      const md = await image.metadata();
+      if (!md.pages || md.pages <= 1) {
+
+        options = { ...options, animated: false };
+        image = await this.instantiateSharpImage(originalImage, edits, options);
+      }
+    }
+    return { image, animated: options.animated };
+  }
+
+  /**
    * Main method for processing image requests and outputting modified images.
    * @param imageRequestInfo An image request.
    * @returns Processed and modified image encoded as base64 string.
    */
   async process(imageRequestInfo: ImageRequestInfo): Promise<Buffer> {
-    const { originalImage, edits } = imageRequestInfo;
+    const { originalImage  } = imageRequestInfo;
     const { SHARP_SIZE_LIMIT } = process.env;
     const limitInputPixels: number | boolean =
       SHARP_SIZE_LIMIT === "" || isNaN(Number(SHARP_SIZE_LIMIT)) || Number(SHARP_SIZE_LIMIT);
-    const options = {
+      
+      const edits: ImageEdits = imageRequestInfo.edits ?? {};
+    const baseOptions = {
       failOnError: false,
-      animated: imageRequestInfo.contentType === ContentTypes.GIF,
+      animated: false,
       limitInputPixels,
     };
     try {
-      // Return early if no edits are required
-      if (!edits || !Object.keys(edits).length) {
-        if (imageRequestInfo.outputFormat !== undefined) {
-          // convert image to Sharp and change output format if specified
-          const modifiedImage = this.modifyImageOutput(
-            await this.instantiateSharpImage(originalImage, edits, options),
-            imageRequestInfo
-          );
-          return await modifiedImage.toBuffer();
-        }
-        // no edits or output format changes, convert to base64 encoded image
-        return originalImage;
-      }
+      const sniff = await sharp(originalImage, { failOnError: false, animated: true, limitInputPixels }).metadata();
+      const isMultiFrame = (sniff.pages ?? 1) > 1;
 
-      // Apply edits if specified
-      options.animated =
-        typeof edits.animated !== "undefined" ? edits.animated : imageRequestInfo.contentType === ContentTypes.GIF;
-      let image = await this.instantiateSharpImage(originalImage, edits, options);
+    let wantAnimated = false;
+    if (isMultiFrame) {
+      wantAnimated = typeof edits.animated !== "undefined" ? !!edits.animated : true;
+    }
 
-      // default to non animated if image does not have multiple pages
-      if (options.animated) {
-        const metadata = await image.metadata();
-        if (!metadata.pages || metadata.pages <= 1) {
-          options.animated = false;
-          image = await this.instantiateSharpImage(originalImage, edits, options);
-        }
-      }
-      // apply image edits
-      let modifiedImage = await this.applyEdits(image, edits, options.animated);
-      // modify image output if requested
-      modifiedImage = this.modifyImageOutput(modifiedImage, imageRequestInfo);
-      return await modifiedImage.toBuffer();
+    const { image, animated } = await this.instantiateForAnimation(
+      originalImage,
+      edits,
+      { ...baseOptions, animated: wantAnimated }
+    );
+
+    const realEditKeys = Object.keys(edits).filter((k) => k !== "animated");
+    const hasRealEdits = realEditKeys.length > 0;
+
+    if (!hasRealEdits) {
+      const out = this.modifyImageOutput(image, imageRequestInfo);
+      return await out.toBuffer();
+    }
+
+    let modifiedImage = await this.applyEdits(image, edits, animated);
+    modifiedImage = this.modifyImageOutput(modifiedImage, imageRequestInfo);
+    return await modifiedImage.toBuffer();
+
+    
     } catch (error) {
       const errorMapping: ErrorMapping[] = [
         {
